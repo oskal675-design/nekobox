@@ -1,0 +1,197 @@
+name: Fork native validation
+run-name: Native validation ${{ github.sha }}
+
+on:
+  push:
+    branches: ['ci/native-validation']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: fork-native-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  SOURCE_SHA: ${{ github.sha }}
+  # This initial CI branch changes only CI files above this repair commit.
+  REPAIR_SOURCE_SHA: a366d5efd23cb6d9510272e1342c39b166492fb0
+
+jobs:
+  windows-msvc:
+    name: Windows x64 full GUI compile and link
+    if: github.repository == 'oskal675-design/nekobox' && github.ref == 'refs/heads/ci/native-validation'
+    runs-on: windows-2022
+    timeout-minutes: 90
+    defaults:
+      run:
+        shell: pwsh
+    env:
+      VCPKG_BINARY_SOURCES: clear
+      VCPKG_DISABLE_METRICS: '1'
+      VCPKG_MAX_CONCURRENCY: '4'
+    steps:
+      - name: Keep source bytes unchanged on checkout
+        run: git config --global core.autocrlf false
+
+      - name: Check out the immutable source revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          submodules: recursive
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Record and verify source provenance
+        run: |
+          New-Item -ItemType Directory -Force ci-logs | Out-Null
+          $actual = (git rev-parse HEAD).Trim()
+          if ($LASTEXITCODE -ne 0 -or $actual -ne $env:SOURCE_SHA) { throw 'Checkout SHA mismatch' }
+          "compiled_sha=$actual" | Tee-Object ci-logs/source.log
+          "workflow_sha=$env:GITHUB_SHA" | Tee-Object -Append ci-logs/source.log
+          "initial_repair_sha=$env:REPAIR_SOURCE_SHA" | Tee-Object -Append ci-logs/source.log
+          git submodule status --recursive | Tee-Object -Append ci-logs/source.log
+          if ($LASTEXITCODE -ne 0) { throw 'Submodule provenance failed' }
+          Get-FileHash src/gharqad/configs/sub/GroupUpdater.cpp, src/nekobox/configs/proxy/V2RayStreamSettings.hpp, src/nekobox/dataStore/ConfigItem.hpp -Algorithm SHA256 | Format-List | Out-String | Tee-Object -Append ci-logs/source.log
+          git merge-base --is-ancestor $env:REPAIR_SOURCE_SHA HEAD
+          if ($LASTEXITCODE -ne 0) { throw 'Initial repair is not an ancestor' }
+          git diff --exit-code $env:REPAIR_SOURCE_SHA HEAD -- . ':(exclude).github/workflows/fork-native-ci.yml' ':(exclude)docs/fork-native-ci.md'
+          if ($LASTEXITCODE -ne 0) { throw 'Unexpected changes outside the CI workflow and documentation' }
+          'production_and_tests_match_initial_repair=true' | Tee-Object -Append ci-logs/source.log
+          Get-Content ci-logs/source.log | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Set up Python for the pinned Qt installer
+        uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
+        with:
+          python-version: '3.12'
+
+      - name: Install official Qt 6.10.0 MSVC2022 x64
+        run: |
+          python -m pip install --no-cache-dir --disable-pip-version-check aqtinstall==3.3.0
+          if ($LASTEXITCODE -ne 0) { throw 'Qt installer setup failed' }
+          python -m aqt install-qt windows desktop 6.10.0 win64_msvc2022_64 --outputdir "$env:RUNNER_TEMP/Qt" 2>&1 | Tee-Object ci-logs/qt-install.log
+          if ($LASTEXITCODE -ne 0) { throw 'Qt installation failed' }
+          $qt = "$env:RUNNER_TEMP/Qt/6.10.0/msvc2022_64"
+          if (!(Test-Path "$qt/lib/cmake/Qt6/Qt6Config.cmake")) { throw 'Qt CMake config missing' }
+          "QT_ROOT=$qt" | Add-Content $env:GITHUB_ENV
+          "$qt/bin" | Add-Content $env:GITHUB_PATH
+
+      - name: Check out pinned official vcpkg registry
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          repository: microsoft/vcpkg
+          ref: 9e593bb18ea69cc5095e012465dcd675a822ed0d # 2026.07.29
+          path: .ci-vcpkg
+          persist-credentials: false
+
+      - name: Build production C++ dependencies
+        run: |
+          $env:VCPKG_ROOT = "$env:GITHUB_WORKSPACE/.ci-vcpkg"
+          "VCPKG_ROOT=$env:VCPKG_ROOT" | Add-Content $env:GITHUB_ENV
+          & "$env:VCPKG_ROOT/bootstrap-vcpkg.bat" -disableMetrics 2>&1 | Tee-Object ci-logs/vcpkg-bootstrap.log
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg bootstrap failed' }
+          & "$env:VCPKG_ROOT/vcpkg.exe" install thrift boost-filesystem boost-dll boost-headers boost-bimap cpr leveldb yaml-cpp quickjs-ng --triplet x64-windows --clean-after-build 2>&1 | Tee-Object ci-logs/vcpkg-build.log
+          if ($LASTEXITCODE -ne 0) { throw 'vcpkg dependency build failed' }
+          "$env:VCPKG_ROOT/installed/x64-windows/bin" | Add-Content $env:GITHUB_PATH
+          "$env:VCPKG_ROOT/installed/x64-windows/tools/thrift" | Add-Content $env:GITHUB_PATH
+          & "$env:VCPKG_ROOT/vcpkg.exe" list | Tee-Object ci-logs/dependency-versions.log
+          if ($LASTEXITCODE -ne 0) { throw 'Cannot record dependency versions' }
+
+      - name: Configure the complete production GUI with MSVC x64
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $vs = (& $vswhere -latest -version '[17.0,18.0)' -products '*' -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath).Trim()
+          if (!$vs) { throw 'Visual Studio 2022 C++ toolchain missing' }
+          Import-Module "$vs/Common7/Tools/Microsoft.VisualStudio.DevShell.dll"
+          Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+          if ($env:VSCMD_ARG_TGT_ARCH -ne 'x64') { throw 'MSVC target is not x64' }
+          foreach ($name in @('PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR', 'VCToolsInstallDir', 'VSINSTALLDIR', 'WindowsSdkDir', 'WindowsSDKVersion', 'VSCMD_ARG_TGT_ARCH')) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ($value) { "$name=$value" | Add-Content $env:GITHUB_ENV }
+          }
+          cmake --version | Tee-Object ci-logs/toolchain.log
+          $qtVersion = & "$env:QT_ROOT/bin/qmake.exe" -query QT_VERSION
+          if ($LASTEXITCODE -ne 0 -or $qtVersion.Trim() -ne '6.10.0') { throw 'Unexpected Qt version' }
+          $qtVersion | Tee-Object -Append ci-logs/toolchain.log
+          $thrift = "$env:VCPKG_ROOT/installed/x64-windows/tools/thrift/thrift.exe"
+          & $thrift --version | Tee-Object -Append ci-logs/toolchain.log
+          if ($LASTEXITCODE -ne 0) { throw 'Thrift generator cannot run' }
+          cmake -S . -B build -G Ninja -DCMAKE_C_COMPILER=cl -DCMAKE_CXX_COMPILER=cl -DCMAKE_BUILD_TYPE=Release "-DCMAKE_PREFIX_PATH=$env:QT_ROOT" "-DCMAKE_TOOLCHAIN_FILE=$env:VCPKG_ROOT/scripts/buildsystems/vcpkg.cmake" -DVCPKG_TARGET_TRIPLET=x64-windows -DVCPKG_MANIFEST_MODE=OFF -DVCPKG_APPLOCAL_DEPS=OFF "-DTHRIFT_COMPILER=$thrift" -DBUILD_GO_PARTS=OFF -DSKIP_UPDATER=OFF -DSKIP_LEVELDB=OFF -DSKIP_JS_UPDATER=OFF 2>&1 | Tee-Object ci-logs/cmake-configure.log
+          if ($LASTEXITCODE -ne 0) { throw 'Production CMake configure failed' }
+          if (Select-String -Path build/CMakeCache.txt -Pattern 'leveldb_DIR:PATH=.*NOTFOUND' -Quiet) { throw 'leveldb unexpectedly disabled' }
+          if (!(Test-Path build/gen-cpp/LibcoreService.h)) { throw 'Thrift generation failed' }
+          $compiler = Get-ChildItem build/CMakeFiles -Recurse -Filter CMakeCXXCompiler.cmake | Select-Object -First 1
+          if (!(Select-String -Path $compiler.FullName -Pattern 'CMAKE_CXX_COMPILER_ID "MSVC"' -Quiet)) { throw 'CMake did not select MSVC' }
+
+      - name: Compile and link the complete nekobox executable
+        run: |
+          cmake --build build --target nekobox --config Release --parallel 4 --verbose 2>&1 | Tee-Object ci-logs/msvc-build.log
+          if ($LASTEXITCODE -ne 0) { throw 'MSVC compile/link failed' }
+          if (!(Test-Path build/nekobox.exe)) { throw 'Linked nekobox.exe missing' }
+          Get-FileHash build/nekobox.exe -Algorithm SHA256 | Format-List | Out-String | Tee-Object ci-logs/linked-executable.log
+          'Full Windows MSVC x64 production target compiled and linked. The executable was not run.' | Add-Content $env:GITHUB_STEP_SUMMARY
+
+      - name: Save only build and provenance logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: windows-msvc-logs-${{ env.SOURCE_SHA }}
+          path: ci-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
+
+  regression:
+    name: Native Qt enum behavior and mutation regressions
+    if: github.repository == 'oskal675-design/nekobox' && github.ref == 'refs/heads/ci/native-validation'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Check out the immutable source revision
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          ref: ${{ env.SOURCE_SHA }}
+          persist-credentials: false
+          fetch-depth: 0
+
+      - name: Record and verify source provenance
+        run: |
+          mkdir -p ci-logs
+          test "$(git rev-parse HEAD)" = "$SOURCE_SHA"
+          git merge-base --is-ancestor "$REPAIR_SOURCE_SHA" HEAD
+          git diff --exit-code "$REPAIR_SOURCE_SHA" HEAD -- . ':(exclude).github/workflows/fork-native-ci.yml' ':(exclude)docs/fork-native-ci.md' 
+          {
+            echo "compiled_sha=$(git rev-parse HEAD)"
+            echo "workflow_sha=$GITHUB_SHA"
+            echo "initial_repair_sha=$REPAIR_SOURCE_SHA"
+            echo "production_and_tests_match_initial_repair=true"
+            sha256sum src/gharqad/configs/sub/GroupUpdater.cpp src/nekobox/configs/proxy/V2RayStreamSettings.hpp src/nekobox/dataStore/ConfigItem.hpp
+          } | tee ci-logs/source.log
+          cat ci-logs/source.log >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Install real Qt6, yaml-cpp and Boost build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y g++ pkg-config qt6-base-dev libyaml-cpp-dev libboost-dev
+          { g++ --version; pkg-config --modversion Qt6Core yaml-cpp; } | tee ci-logs/toolchain.log
+
+      - name: Run actual production enum and XHTTP behavior regression
+        run: |
+          python3 tests/clash-xhttp-import/test_clash_xhttp_import.py 2>&1 | tee ci-logs/xhttp-regression.log
+
+      - name: Prove all eight regression mutations are rejected
+        run: |
+          python3 tests/clash-xhttp-import/mutation_checks.py 2>&1 | tee ci-logs/xhttp-mutations.log
+          echo 'Focused native Qt/yaml-cpp regression and eight mutations passed. Production enum types are real; factory/storage adapters remain. No app, core, or VPN runtime was exercised.' >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save only test and provenance logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: native-regression-logs-${{ env.SOURCE_SHA }}
+          path: ci-logs/*.log
+          if-no-files-found: warn
+          retention-days: 7
