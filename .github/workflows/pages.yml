@@ -6,6 +6,7 @@ on:
 name: Build and deploy GH Pages
 jobs:
   build:
+    if: github.repository == 'qr243vbi/nekobox'
     runs-on: ubuntu-latest
     permissions:
       contents: write

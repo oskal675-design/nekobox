@@ -92,6 +92,7 @@ on:
         required: false
 jobs:
   get-tag-and-changelog:
+    if: github.repository == 'qr243vbi/nekobox'
     permissions:
       contents: write
       actions: read
@@ -126,6 +127,7 @@ jobs:
           set_output_file text build/changelog.txt
 
   build-go:
+    if: github.repository == 'qr243vbi/nekobox'
     permissions:
       contents: write
       actions: read
@@ -256,7 +258,7 @@ jobs:
       - build-go
       - get-tag-and-changelog
     runs-on: ubuntu-latest
-    if: github.event.inputs.publish == 'true' && github.event.inputs.binary_only == 'false' && github.event.inputs.pre_release == 'false'
+    if: github.repository == 'qr243vbi/nekobox' && (github.event.inputs.publish == 'true' && github.event.inputs.binary_only == 'false' && github.event.inputs.pre_release == 'false')
     steps:
       - name: Checking out sources
         uses: actions/checkout@main
@@ -354,7 +356,7 @@ jobs:
             allow: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.build_windows_x86 == 'true' }}
       fail-fast: false
     runs-on: ${{ matrix.platform }}
-    if: (github.event_name == 'push' || github.event.inputs.source_only != 'true')
+    if: github.repository == 'qr243vbi/nekobox' && ((github.event_name == 'push' || github.event.inputs.source_only != 'true'))
     env:
       ACTIONS_ALLOW_UNSECURE_COMMANDS: true
       INPUT_VERSION: ${{ needs.get-tag-and-changelog.outputs.tag }}
@@ -479,7 +481,7 @@ jobs:
 
   build-ubuntu:
     name: Build linux binaries
-    if: github.event.inputs.build_ubuntu == 'true' && (github.event_name == 'push' || github.event.inputs.source_only != 'true')
+    if: github.repository == 'qr243vbi/nekobox' && (github.event.inputs.build_ubuntu == 'true' && (github.event_name == 'push' || github.event.inputs.source_only != 'true'))
     permissions:
       contents: write
       actions: read
@@ -605,7 +607,7 @@ jobs:
       actions: read
     env:
       INPUT_VERSION: ${{ needs.get-tag-and-changelog.outputs.tag }}
-    if: github.event.inputs.publish == 'true' && (github.event_name == 'push' || github.event.inputs.source_only != 'true') && github.event.inputs.pre_release != 'true'
+    if: github.repository == 'qr243vbi/nekobox' && (github.event.inputs.publish == 'true' && (github.event_name == 'push' || github.event.inputs.source_only != 'true') && github.event.inputs.pre_release != 'true')
     steps:
       - name: Checking out sources
         uses: actions/checkout@main
