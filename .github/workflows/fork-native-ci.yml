@@ -105,6 +105,9 @@ jobs:
           if (!$vs) { throw 'Visual Studio 2022 C++ toolchain missing' }
           Import-Module "$vs/Common7/Tools/Microsoft.VisualStudio.DevShell.dll"
           Enter-VsDevShell -VsInstallPath $vs -SkipAutomaticLocation -DevCmdArguments '-arch=x64 -host_arch=x64'
+          # VS developer-shell initialization replaces VCPKG_ROOT with its bundled copy.
+          $env:VCPKG_ROOT = "$env:GITHUB_WORKSPACE/.ci-vcpkg"
+          if (!(Test-Path "$env:VCPKG_ROOT/installed/x64-windows/tools/thrift/thrift.exe")) { throw 'Pinned Thrift generator missing' }
           if ($env:VSCMD_ARG_TGT_ARCH -ne 'x64') { throw 'MSVC target is not x64' }
           foreach ($name in @('PATH', 'INCLUDE', 'LIB', 'LIBPATH', 'VCINSTALLDIR', 'VCToolsInstallDir', 'VSINSTALLDIR', 'WindowsSdkDir', 'WindowsSDKVersion', 'VSCMD_ARG_TGT_ARCH')) {
             $value = [Environment]::GetEnvironmentVariable($name)
